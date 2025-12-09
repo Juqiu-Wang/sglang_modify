@@ -593,7 +593,7 @@ class EAGLEWorker(TpModelWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            spec_steps=current_step,  # [修改] 传入当前步数
+            current_step,  # [修改] 传入当前步数
             batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,

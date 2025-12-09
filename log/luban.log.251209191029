@@ -1,0 +1,8 @@
+2025-12-09 19:10:29.905 | INFO     | lubanml.util.user_util:set_username:62 - username[juqiuwang] set to config success
+2025-12-09 19:10:29.905 | INFO     | lubanml.util.user_util:user_check:40 - tool run username: juqiuwang
+2025-12-09 19:10:29.909 | INFO     | lubanml.cli.cli_model:gemini_instance:45 - start a gemini job
+2025-12-09 19:10:29.909 | INFO     | lubanml.util.utils:params_parse:425 - params_replace_dict: {'image_version': 'mirrors.tencent.com/mmsearch-ai-research/search_frontier:v0.1.4'}
+2025-12-09 19:10:29.909 | INFO     | lubanml.runner.gemini_instance_runner:run:84 - http://lubanmlapi.woa.com/luban/ModelTrain/GeminiCreate
+2025-12-09 19:10:29.909 | INFO     | lubanml.runner.gemini_instance_runner:run:85 - {'task_name': '', 'task_type': 'gemini', 'desc': '', 'gpu_type': 'h20', 'cluster_id': 'hz-1', 'card_num': 8, 'is_low': False, 'business_line': 'group_airesearch_1', 'extra_params': {'image_version': 'mirrors.tencent.com/mmsearch-ai-research/search_frontier:v0.1.4'}}
+2025-12-09 19:10:30.735 | INFO     | lubanml.runner.gemini_instance_runner:run:108 - task create success, address: https://lubanml.woa.com/#/modelmanage/ModelTrainDetail?id=111705
+2025-12-09 19:10:30.735 | INFO     | lubanml.exception.except_dec:wrapped_func:55 - task_type:gemini-instance, state:success, time: 1
