@@ -54,6 +54,12 @@ class EAGLEDraftCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+
+        # [修改]定义需要录制的挡位
+        self.supported_steps = sorted(list(set([1, 2, 4, self.speculative_num_steps])))
+        self.supported_steps = [s for s in self.supported_steps if s <= self.speculative_num_steps]
+        self.graphs_by_step = {}  # 用于存储不同 step 的图字典: {step: {bs: graph}}
+
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -170,8 +176,24 @@ class EAGLEDraftCudaGraphRunner:
     def _replay(self, forward_batch: ForwardBatch):
         self.graphs[self.bs].replay()
 
-    def capture(self):
-        CudaGraphRunner.capture(self)
+    def capture(self): # [修改]
+        original_steps = self.speculative_num_steps
+        
+        # 遍历每一个档位进行录制
+        for step in self.supported_steps:
+            # 临时修改 step，这样 capture_one_batch_size 里的逻辑就会只录制 step 步
+            self.speculative_num_steps = step
+            self.graphs = {}  # 清空当前 graphs，供父类 CudaGraphRunner 使用
+            
+            # 调用父类的 capture 流程 (它会调用我们的 capture_one_batch_size)
+            CudaGraphRunner.capture(self)
+            
+            # 将录制好的图保存到 graphs_by_step
+            self.graphs_by_step[step] = self.graphs
+            
+        # 恢复原始的最大步数，并将 graphs 指向最大步数的图 (作为默认 fallback)
+        self.speculative_num_steps = original_steps
+        self.graphs = self.graphs_by_step[original_steps]
 
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
@@ -186,7 +208,11 @@ class EAGLEDraftCudaGraphRunner:
         seq_lens_cpu = self.seq_lens_cpu[:num_seqs]
         extend_seq_lens = self.extend_seq_lens[:num_seqs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:num_seqs]
-        out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
+
+        # [修改] 使用当前的 self.speculative_num_steps (它在 capture 循环中被修改了)
+        current_steps = self.speculative_num_steps 
+        out_cache_loc = self.out_cache_loc[: num_tokens * current_steps]
+
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
         hidden_states = self.hidden_states[:num_seqs]
@@ -289,7 +315,14 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
+            # [新增] 临时修改 worker 的步数以匹配当前录制的图
+            original_worker_steps = self.eagle_worker.speculative_num_steps
+            self.eagle_worker.speculative_num_steps = current_steps
+            
             ret = self.eagle_worker.draft_forward(forward_batch)
+            
+            # [新增] 恢复 worker 步数
+            self.eagle_worker.speculative_num_steps = original_worker_steps
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -311,10 +344,18 @@ class EAGLEDraftCudaGraphRunner:
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
         return parent_list, top_scores_index, draft_tokens
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay(self, forward_batch: ForwardBatch, step: int):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
 
+        # [新增] 根据传入的 step 选择对应的图集合
+        if step not in self.graphs_by_step:
+             # Fallback 到最接近的或者最大的
+             step = self.speculative_num_steps
+        
+        # 临时将 self.graphs 指向当前 step 的图，以便 _replay 调用
+        self.graphs = self.graphs_by_step[step]
+        
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
@@ -340,9 +381,13 @@ class EAGLEDraftCudaGraphRunner:
 
         # Common inputs
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-            forward_batch.out_cache_loc
+
+        # [修改] Copy input 时只拷贝 step 长度的数据
+        # out_cache_loc 的长度是 dynamic 的
+        self.out_cache_loc[: raw_num_token * step].copy_(
+            forward_batch.out_cache_loc[: raw_num_token * step]
         )
+
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)

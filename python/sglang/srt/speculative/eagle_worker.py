@@ -99,6 +99,10 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
 
+        # [新增] 初始化平均接收长度，默认为最大值以启动
+        self.avg_acc_len = float(self.speculative_num_steps)
+        self.ema_alpha = 0.1  # 指数移动平均的衰减因子
+
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -504,6 +508,7 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
+    # 修改 draft 函数，实现动态步数选择
     def draft(self, batch: ScheduleBatch):
         # Parse args
         if batch.forward_mode.is_idle():
@@ -525,12 +530,27 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+
+        # [新增] 动态步数选择逻辑
+        if self.avg_acc_len < 1.7:
+            current_step = 1
+        elif self.avg_acc_len < 2.4:
+            current_step = 2
+        elif self.avg_acc_len < 3.8:
+            current_step = 4
+        else:
+            current_step = self.speculative_num_steps
+        
+        # 确保不超过配置的最大值
+        current_step = min(current_step, self.speculative_num_steps)
+
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
         if can_cuda_graph:
+            # [修改] 调用 replay 时传入 step
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
+                forward_batch, step=current_step
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
@@ -540,10 +560,18 @@ class EAGLEWorker(TpModelWorker):
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+            
+            # [修改] 手动修改 speculative_num_steps 供 draft_forward 使用
+            original_steps = self.speculative_num_steps
+            self.speculative_num_steps = current_step
+            
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+
+            # 恢复原始步数
+            self.speculative_num_steps = original_steps
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -565,6 +593,7 @@ class EAGLEWorker(TpModelWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
+            spec_steps=current_step,  # [修改] 传入当前步数
             batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
@@ -579,7 +608,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             retrive_cum_len=None,
-            spec_steps=self.speculative_num_steps,
+            spec_steps=current_step,  # [修改] 传入当前步数
             topk=self.topk,
             draft_token_num=self.server_args.speculative_num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -663,6 +692,7 @@ class EAGLEWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
+    # 修改 verify 函数，更新 avg_acc_len
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
@@ -725,6 +755,13 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+
+        # [新增] 更新移动平均接收长度
+        # res.accept_length_per_req_cpu 是一个 list[int]
+        if len(res.accept_length_per_req_cpu) > 0:
+            current_batch_avg = sum(res.accept_length_per_req_cpu) / len(res.accept_length_per_req_cpu)
+            # 使用指数移动平均 (EMA) 更新，避免剧烈波动
+            self.avg_acc_len = (1 - self.ema_alpha) * self.avg_acc_len + self.ema_alpha * current_batch_avg
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
